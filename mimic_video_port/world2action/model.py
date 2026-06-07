@@ -86,21 +86,21 @@ class World2ActionModelConfig:
     # Unused (normalization spec now comes from yams_config, not here); kept for config compatibility.
     data_config: DictConfig | None = None
 
+    # Validation action-MSE eval: sigmas at which to run the policy's ACTUAL sampler on held-out data and
+    # measure the predicted action chunk vs the demo (raw joint space). Empty -> only the cheap held-out
+    # RF loss is computed. Each sigma costs one extra frozen-backbone forward + a denoise loop, so keep
+    # this short (e.g. [0.3, 0.6]) for periodic eval. Logged by callbacks.World2ActionWandb.
+    val_action_sigmas: list = attrs.field(factory=list)
+
 
 def _dp_mean(x: torch.Tensor) -> torch.Tensor:
     if dist.is_available() and dist.is_initialized():
-        group = parallel_state.get_data_parallel_group()
         world = parallel_state.get_data_parallel_world_size()
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
-        x /= world
+        if world > 1:  # skip the collective on 1 GPU (also avoids an all_reduce under inference_mode)
+            group = parallel_state.get_data_parallel_group()
+            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+            x /= world
     return x
-
-
-def _dp_mean_dict(d: dict[str, object], device: torch.device) -> dict[str, float]:
-    keys = list(d.keys())
-    t = torch.stack([torch.as_tensor(d[k], device=device, dtype=torch.float32) for k in keys], dim=0)
-    t = _dp_mean(t)
-    return {k: t[i].item() for i, k in enumerate(keys)}
 
 
 class World2ActionModel(ImaginaireModel):
@@ -274,6 +274,18 @@ class World2ActionModel(ImaginaireModel):
         self.pipe.eval()
         self.pipe.denoising_model().train()
 
+    def train(self, mode: bool = True) -> "World2ActionModel":
+        # The trainer flips the WHOLE model to eval() for validation and back to train() afterwards
+        # (trainer.py: model.eval() -> next step's model_ddp.train()). Stock nn.Module.train() would then
+        # put the frozen 2B backbone into train mode -> dropout/etc. active -> non-deterministic tapped
+        # features. Re-assert the exact freeze semantics here so any train/eval cycling is safe: backbone
+        # always eval, pipe frozen-parts eval, only the trainable action decoder follows `mode`.
+        super().train(mode)
+        self.backbone.eval()
+        self.pipe.eval()
+        self.pipe.denoising_model().train(mode)
+        return self
+
     def add_lora_to_model(
         self,
         model,
@@ -440,29 +452,53 @@ class World2ActionModel(ImaginaireModel):
 
     @torch.inference_mode()
     def validation_step(self, data_batch: dict, iteration: int):
-        # Loss + a "ground-truth-video" MSE sweep: predict the action chunk from features tapped at a
-        # range of video noise levels and compare to the demonstrated actions. The "generated-video"
-        # sweep (mimic-video's genvid via video2world_pipe.generate_video) needs a backbone sampler and
-        # is deferred to the eval port (step 4).
+        """Held-out eval, logged to W&B by callbacks.World2ActionWandb.
+
+        Always: the rectified-flow velocity loss on held-out data (output_batch["loss"]) -- cheap (one
+        frozen-backbone forward), the unbiased analogue of the training curve.
+
+        If config.val_action_sigmas is non-empty: also run the policy's ACTUAL sampler at each sigma and
+        measure the sampled action chunk's MSE vs the demonstrated actions in RAW joint space
+        (output_batch["action_mse"]) -- the closest in-training proxy for real-rollout quality -- plus a
+        "hold the last observed joint state" reference (output_batch["action_baseline_mse"]) the policy
+        should beat. Costs one extra frozen-backbone forward + a denoise loop per sigma, so keep the list
+        short. All scalars are DP-reduced here; the callback just averages across val batches + logs.
+        """
         output_batch, loss = self.training_step(data_batch, iteration)
-        unnormed_x0_B_HA_A = data_batch["action/lowdim_concat"]
 
-        output_batch["mses"] = collections.defaultdict(list)
+        sigmas = list(getattr(self.config, "val_action_sigmas", []) or [])
+        if sigmas:
+            gt_B_HA_A = data_batch["action/lowdim_concat"].float()
+            B, HA, _A = gt_B_HA_A.shape
+            obs_B_HO_O = data_batch["obs/lowdim_concat"].float()
+            # "do nothing" trajectory: hold the last observed joint state over the whole horizon.
+            held_B_HA_A = obs_B_HO_O[:, -1:].expand(-1, HA, -1) if obs_B_HO_O.shape[1] > 0 else None
+            # Normalized (per-dim unit-variance) space weights all joints equally, so the few joints that
+            # move in a task aren't drowned by the static ones. Reuse the action normalizer (on_train_start).
+            norm = (
+                self.pipe.normalizer.norms["action/lowdim_concat"]
+                if "action/lowdim_concat" in self.pipe.normalizer.norms
+                else None
+            )
 
-        for video_sigma in torch.linspace(0.1, 0.9, 9, device=self.tensor_kwargs["device"]):
-            video_sigma_B_1 = video_sigma.repeat(unnormed_x0_B_HA_A.shape[0]).unsqueeze(1)
-            unnormed_x0_pred_B_HA_A = self.predict(data_batch, video_sigma_B_1).float()
+            if held_B_HA_A is not None:  # baseline = how much the demo actually moves (the do-nothing error)
+                output_batch["action_baseline_mse"] = _dp_mean(F.mse_loss(held_B_HA_A, gt_B_HA_A).detach().clone()).item()
 
-            mses_gtvid = {
-                "gtvid/full": F.mse_loss(unnormed_x0_pred_B_HA_A, unnormed_x0_B_HA_A.float()),
-            }
-            mses_gtvid = _dp_mean_dict(mses_gtvid, device=unnormed_x0_pred_B_HA_A.device)
-
-            if dist.is_available() and dist.is_initialized() and parallel_state.get_data_parallel_rank() != 0:
-                continue
-
-            for name, mse in mses_gtvid.items():
-                output_batch["mses"][name].append((video_sigma.item(), mse))
+            action_mse: dict[str, float] = {}
+            echo_terms, nmse_terms = [], []
+            for s in sigmas:
+                video_sigma_B_1 = torch.full((B, 1), float(s), **self.tensor_kwargs)
+                pred_B_HA_A = self.predict(data_batch, video_sigma_B_1).float()
+                action_mse[f"{float(s):.2f}"] = _dp_mean(F.mse_loss(pred_B_HA_A, gt_B_HA_A).detach().clone()).item()
+                if held_B_HA_A is not None:  # echo = distance from the do-nothing solution (copy-detector)
+                    echo_terms.append(F.mse_loss(pred_B_HA_A, held_B_HA_A))
+                if norm is not None:  # per-dim-fair action error
+                    nmse_terms.append(F.mse_loss(norm(pred_B_HA_A), norm(gt_B_HA_A)))
+            output_batch["action_mse"] = action_mse
+            if echo_terms:
+                output_batch["action_echo_mse"] = _dp_mean(torch.stack(echo_terms).mean().detach().clone()).item()
+            if nmse_terms:
+                output_batch["action_nmse"] = _dp_mean(torch.stack(nmse_terms).mean().detach().clone()).item()
 
         return output_batch, loss
 

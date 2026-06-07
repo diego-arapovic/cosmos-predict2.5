@@ -39,9 +39,19 @@ class MimicDataset(torch.utils.data.Dataset):
         num_val_episodes: int = 1,
         train: bool = True,
         verbose: bool = False,
+        instruction_filter: list[str] | None = None,
     ) -> None:
         self._data_dir = pathlib.Path(data_dir)
         self._episode_paths = get_paths(self._data_dir, verbose=verbose)
+        if instruction_filter:  # train on a subset of tasks: keep only episodes whose instruction matches
+            import zarr as _zarr
+
+            allow = set(instruction_filter)
+            kept = [p for p in self._episode_paths if _zarr.open(str(p), "r").attrs.get("instruction") in allow]
+            print(f"[MimicDataset] instruction_filter kept {len(kept)}/{len(self._episode_paths)} episodes for {sorted(allow)}")
+            if not kept:
+                raise ValueError(f"instruction_filter matched 0 episodes for {sorted(allow)}")
+            self._episode_paths = kept
 
         def get_source_component(key: str, spec: dict, prefix: str) -> tuple[str, ObsMeta]:
             source_name = source_component_names.get(f"{prefix}/{key}", key)
@@ -97,6 +107,13 @@ class MimicDataset(torch.utils.data.Dataset):
 
         self._threadpool_limits_is_applied = False
         self._should_ignore_transforms_for_norm = False
+
+        # val_mask is the per-split episode selection (train = ~val episodes). Report the SELECTED count,
+        # not len(self._episode_paths) (which is the post-instruction-filter pool, identical for both splits).
+        print(
+            f"[MimicDataset] {'train' if train else 'val'} split: "
+            f"{int(val_mask.sum())} of {len(self._episode_paths)} episodes, {len(self._chunk_reader)} chunks"
+        )
 
     @property
     def data_dir(self) -> pathlib.Path:

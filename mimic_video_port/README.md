@@ -44,8 +44,17 @@ full fine-tune + latent-frame injection).
 ```
 bash mimic_video_port/setup.sh                       # 1. env (uv) + foundation smokes + data-prep deps
 bash mimic_video_port/commands/prepare_data.sh       # 2. data: scratch zarr re-derived from raw; Reason1+stats cached to S3
-bash mimic_video_port/commands/train.sh              # 3. train: resume from S3 -> torchrun -> checkpoints to S3   [being built]
+bash mimic_video_port/commands/train.sh              # 3. train: resume from S3 -> torchrun -> checkpoints to S3
 ```
+Train variants (EXP=): `yams_smoke` (3-iter gate, no W&B) · `yams_medium` (short run **with W&B curves + held-out
+eval** — watch it learn) · `yams` (full run). See "Training a subset / watching it learn" below. List the task
+strings to subset on: `python mimic_video_port/commands/list_instructions.py`.
+
+**Run identity / resume.** Each `train.sh` launch is its **own** run by default (timestamped `RUN_NAME` →
+fresh W&B id + fresh checkpoint dir), so repeated smokes don't pile onto one W&B run. To resume a long run
+after an instance restart, relaunch with the **same** stable name, e.g. `RUN_NAME=yams_full_v1 EXP=yams …`
+— it pulls that run's checkpoint **and** W&B id from S3 and continues the same curve. (Checkpoints +
+`wandb_id.txt` are mirrored to `s3://…/world2action/checkpoints/<RUN_NAME>{,.wandb_id.txt}`.)
 
 ## The exact model (our finetuned backbone)
 From the finetune's `config.yaml`:
@@ -149,9 +158,41 @@ via `world2action/checkpoints.py::register_external_checkpoints()` (call once be
   `model.clip_grad_norm_`). Entrypoint: `python -m scripts.train --config=cosmos_predict2/configs/config.py -- experiment=<name>`.
 - **Callbacks assume a video2world model.** The `basic` callbacks (group package `trainer.callbacks`) include
   `compile_tokenizer` which does `model.tokenizer` → `World2ActionModel` exposes a `.tokenizer` property (the frozen
-  backbone VAE) so it works (and `compile`s the VAE encode = perf win). `.tokenizer`/EMA-sampling callbacks that aren't
-  in `basic` (`val_loss_computation`, `every_n_draw_sample`) don't run (validation off). The trainer loop + callbacks +
-  DDP + DCP are first exercised by `commands/train.sh` — the config smoke bypasses them (`DESIGN_RISKS.md` #21).
+  backbone VAE) so it works (and `compile`s the VAE encode = perf win). The stock video-drawing/EMA-sampling callbacks
+  (`val_loss_computation`, `every_n_draw_sample`) are NOT in `basic`, so they never run on our model.
+- **Training metrics are already complete (stock `basic` callbacks log to W&B).** `grad_clip` clips at norm 1.0 and logs
+  `clip_grad_norm/video`; `iter_speed` logs step time/throughput; `device_monitor` logs `DeviceMonitor/*` (GPU mem/util/
+  power/temp/clock, CPU mem). Combined with our `train/loss`+`optim/lr`, the standard set (loss, lr, **grad-norm**,
+  throughput, device) is covered — no extra training-metric code needed.
+- **W&B + in-training eval (our own callback).** The stock `WandbCallback` is unusable here (it reads a diffusion
+  `output_batch["edm_loss"]` we don't produce, and can't log an action eval). `world2action/callbacks.py::World2ActionWandb`
+  replaces it: logs `train/loss`, `train/Var_inst[x_0]`, `optim/lr`, and — when validation runs — the eval set below. It does
+  **no collective ops** — the model DP-reduces every scalar; the callback only accumulates + logs on rank0. Wired via the
+  canonical group-merge `override /callbacks: ["basic", "w2a_wandb"]` (registered in `yams_experiment.py`), so
+  `yams_medium`/`yams` get basic + our logger; `yams_smoke` keeps plain `basic` (no W&B). W&B mode = `job.wandb_mode`
+  (← `WANDB_MODE` env; `train.sh` auto-picks online when credentials exist, else offline → `wandb sync` later).
+- **Eval metrics (the "is it learning a *good* policy" signal).** `val/loss` (held-out RF velocity loss, always);
+  and when `config.val_action_sigmas` is set, the policy's ACTUAL sampled action chunk vs the demo: `val/action_mse_mean`
+  (raw joint space) + `val/action_nmse_mean` (per-dim unit-variance, so the few moving joints aren't drowned),
+  `val/baseline_hold_last_mse` (= how much the demo moves; the do-nothing error), `val/echo_mse` (distance from
+  do-nothing), and `val/skill_ratio` = action_mse/baseline (<1 beats do-nothing; logged only when baseline>0).
+  **Why echo + baseline matter:** with absolute-joint BC the decoder is *given* the current pose and the target is
+  dominated by "hold it", so it can collapse to **echoing proprio and ignoring the video/language features**. (action_mse,
+  echo_mse) read against baseline is the copy↔perfect axis that exposes this — but it's only informative when **baseline > 0**
+  (the val set actually moves), hence the representative val set below. The language-sensitivity probe (does the prediction
+  change with the instruction?) is the gold-standard anti-collapse check but only meaningful **multi-task** → deferred.
+- **Validation runs for `yams_medium`/`yams`** (`run_validation=True`). `validation_step` always computes the cheap held-out
+  RF loss; the sampled-action eval runs only at `config.val_action_sigmas` (now a **single** σ=0.5 → ~1 extra backbone
+  forward + a denoise loop per chunk), capped by `trainer.max_val_iter` (8) over `num_val_episodes` (8) **shuffled** so the
+  baseline isn't a static-sample fluke. **Cost/frequency:** iter-0 (baseline) then every `validation_iter` — medium=500
+  (~2-3 min/val ≈ **~3%** of wall-clock), full=2000 (**<1%**). Enabling validation cycles `model.eval()→train()`, so
+  `World2ActionModel.train()` is overridden to **keep the frozen backbone in eval** (else its dropout makes the tapped
+  features non-deterministic). **Gate PASSED on the node (2026-06-07):** the tiny `yams_medium` override run exercised
+  iter-0 + periodic validation, the sampled-action eval, W&B (offline), `train()/eval()` cycling, and a DCP save → S3.
+  It surfaced `baseline≈0` on a 2-episode val sample → fixed by the representative shuffled val set + echo/normalized metrics.
+- **Dataloaders shuffle.** Train uses `shuffle=True` (was sequential → SGD saw one episode at a time, fine for the 3-iter
+  smoke but wrong for a real run); val uses `shuffle=True` so the `max_val_iter`-capped sample spreads across episodes.
+  Multi-GPU still needs a `DistributedSampler` for correct sharding (`DESIGN_RISKS.md` #23).
 
 ## What's next (the build)
 **DONE (runtime-validated on the node unless noted):** `checkpoints.py`, `dit.py` (fwd PASS),
@@ -204,17 +245,90 @@ Remaining, in dependency order:
      (per-rank `batch_size`, `sampler=None` → DDP-handled), `defaults: [{override /ckpt_type: dcp}, ...]`, `trainer`
      (`distributed_parallelism="ddp"`, lr 1e-4, bf16, grad_clip callback), `job.path_local=$W2A_DATA/checkpoints/world2action`.
      **Launch (GPU-agnostic):** `torchrun --nproc_per_node=N -m scripts.train --config=mimic_video_port/config_yams.py -- experiment=yams_smoke`.
-     **Config gate PASS:** `train_config_smoke.py yams_smoke` (compose+model+dataloader+one step). **`commands/train.sh` BUILT:**
-     prepare_data → resume latest checkpoint from S3 → `torchrun` → mirror checkpoints to S3 (periodic + on exit;
-     `IMAGINAIRE_OUTPUT_ROOT=$W2A_DATA/runs` so they land on scratch). **NEXT GATE — the real smoke-sized run (DDP+DCP+loop):**
-     `bash mimic_video_port/commands/train.sh` (EXP=yams_smoke, 1 GPU, 3 iters). If green → `EXP=yams NGPU=N bash …/train.sh`.
+     **DONE — full training run PASS on the node (2026-06-07).** `bash commands/train.sh` (EXP=yams_smoke, 1 GPU) ran
+     3 iters through the real `ImaginaireTrainer` (DDP + callbacks + DCP) and wrote `iter_000000003/` to
+     `s3://…/world2action/checkpoints/yams_smoke/`. **The whole stack is proven end-to-end on real data.**
+     Throughput: ~10–17 s/step (batch 1, 720p, 1 GPU; backbone forward dominates). Memory: ~40 GB/96 GB peak.
+     **Real run:** `EXP=yams NGPU=<n> RUN_NAME=yams_full_v1 bash mimic_video_port/commands/train.sh` (use a
+     stable `RUN_NAME` so an instance restart resumes it: relaunch with the same name). Tune per-run via env:
+     `W2A_INSTRUCTIONS="instr a|instr b"` trains a **task subset** (exact instruction match);
+     `OVERRIDES="trainer.max_iter=10000 checkpoint.save_iter=1000 dataloader_train.batch_size=1"` sets any Hydra field.
+     **Throughput ≈ 10 s/optimizer-step on 1 GPU** (compute-bound on the frozen-backbone forward → **batch does NOT speed
+     wall-clock; GPUs do, ~linearly**). Wall-clock ≈ `max_iter × 10 s / NGPU` (≈ `max_iter / (360·NGPU)` hours). Feature
+     caching isn't viable (features depend on the per-step σ → storage explodes); the lever is GPUs (+ context-parallel later).
+     Long "play data" eps inflate epoch size (#20).
      ⚠️ **Throughput (risk #8):** the per-step frozen-backbone forward at 720p (≈86k tokens) is the bottleneck; scales ~linearly
-     with GPUs (data-parallel). Measure per-step time on the smoke; a long single-GPU run likely wants feature caching or more GPUs.
-3. **Eval + real-world deployment (an explicit end goal):** a **live YAMS rollout loop** — read camera_top
-   (720p) + YAM proprio + the task instruction, run the frozen backbone tap + `World2ActionPipeline.__call__`
-   (the decoder sampler) to predict an action chunk, and command the bimanual arms; loop. The mimic-video
-   LIBERO/Bridge sim eval is only a reference for the inference wiring. Inference reuses the **same** Reason1
-   instruction cache + 720p prep as training so features stay in-distribution.
+     with GPUs (data-parallel). A long single-GPU run wants more GPUs. **Feature caching is infeasible** — the tapped features
+     are ≈86k tokens × 2048 ≈ **350 MB/chunk** (× ~83k chunks = PBs), so the backbone forward (~10 s/sample/GPU) is unavoidable
+     per step. Realistic full-run cost ≈ `samples × 10 s / NGPU` (one 83k-chunk epoch ≈ **1.2 days on 8 GPUs**); the only sub-GPU
+     lever is early-exiting the backbone at the tap layer (~30%, deferred, risk #7).
+
+   - **Full-run readiness — the recipe WORKS (completed 1500-step run `d9psqgwk`; DESIGN_RISKS #27–30).** Strong, monotonic,
+     no overfit: train/loss 25→**7**, **val/loss 27→5** (val ≤ train ⇒ shuffle killed the overfit), action_mse@σ0.5 0.34→**0.07**,
+     action_**nmse** 1.63→**0.39** (≪1 ⇒ well past predict-the-mean), `echo`>0 (not collapsed to proprio). Curves still steep at
+     1500 ⇒ **not converged — the lever is more steps.** (`train/loss` is a weak metric — RF noise floor; judge by **nmse** + the
+     σ=1.0 eval.) Parity with the original mimic-video (`/model/cosmos_predict2/...`):
+       1. **Batch: mimic-video uses global 128–256; we ran 1 — and it learned fine.** So batch is NOT the blocker (earlier claim
+          retracted). Bigger effective batch is an **optional** smoother; for the full run aim for a **modest** eff-batch (~8–32 via
+          `GRAD_ACCUM`×NGPU) and **prioritise steps over batch** — throughput (720p/86k tokens, ~10–20× mimic-video's 480p/19k) is
+          the real constraint (~10 s/sample/GPU; one 83k-chunk epoch ≈ 1.2 d on 8 GPUs). Don't chase batch 128.
+       2. **Decoder `alpha` 1.5 → 1.0 (fixed).** Matches mimic-video's uniform decoder-timestep sampling (1.5 also worked, but 1.0
+          is the reference/standard). lr=1e-4, loss_scale=10, num_denoising_steps=10, obs_dropout=0.2, sampler+`denoise` all match.
+       3. **Eval σ → (0.9, 1.0).** The 0.34→0.07 above is at σ=0.5, which **leaks half the GT future** ⇒ optimistic. High σ = future
+          is (near-)pure noise = the trained+deployed regime. Watch `val/action_mse/sigma1.00` — that's the honest number.
+       4. **genvid not ported (#30).** mimic-video's real deploy/eval *generates* the future video and taps along the denoise
+          schedule; we single-forward at one σ (a crude proxy). If σ=1.0 skill stalls, this is the fix — port before trusting deploy numbers.
+     **No new code changes were warranted by this run** — it validates the recipe + the two parity fixes above; every other knob held.
+     **The full run:** the same config, much longer, on more GPUs. Verdict to watch: `val/action_nmse` keeps falling and
+     `val/skill_ratio`@σ=1.0 trends toward/below 1 (`skill_ratio` is a *harsh* bar here — tiny raw motions make "do nothing" strong,
+     so nmse is the cleaner signal). EMA (`ema.enabled`) is a final-policy polish to add *after* this holds (untested path → smoke it).
+
+   - **Training a subset / watching it learn (W&B + eval).** `python mimic_video_port/commands/list_instructions.py` prints the
+     task strings + episode counts (the dataset also prints `N episodes, M chunks` at startup). To train just one task on 1 GPU:
+     ```
+     W2A_INSTRUCTIONS="push the box to the right with the right arm" \
+     OVERRIDES="trainer.max_iter=10000 checkpoint.save_iter=1000 trainer.logging_iter=50 dataloader_train.batch_size=1" \
+     EXP=yams NGPU=1 bash mimic_video_port/commands/train.sh
+     ```
+     "push the box to the right with the right arm" = 269/487 eps = **82,852 train chunks/epoch** (exact, prints at startup).
+     At ~10 s/step (batch 1): 10k steps ≈ **28 h**, 20k ≈ 56 h, 50k ≈ 5.8 days (≈ `max_iter / 360` h on 1 GPU; batch 1 = max
+     gradient updates per hour). One full epoch (~83k steps) ≈ 10 days on 1 GPU → for a usable single-task policy, add GPUs
+     (~linear) rather than wait. **Don't pick a step count blindly — watch `val/skill_ratio`/`action_nmse` and stop when they plateau.**
+   - **`yams_medium` — short run with W&B curves + held-out eval** ("see that it's learning a good policy"). Logs `train/loss`
+     (+ grad-norm/throughput/GPU from the stock callbacks) and the eval set (`val/loss`, `val/action_mse_mean`,
+     `val/action_nmse_mean`, `val/baseline_hold_last_mse`, `val/echo_mse`, `val/skill_ratio`). Default 1500 iters (~4 h on 1 GPU);
+     validation at iter 0 then every 500 (~3% of wall-clock). Fastest clear learning curve = pair with a single task:
+     ```
+     wandb login        # once, for live curves (else it logs offline -> `wandb sync <job_dir>` later)
+     W2A_INSTRUCTIONS="push the box to the right with the right arm" \
+     EXP=yams_medium NGPU=1 bash mimic_video_port/commands/train.sh
+     ```
+     **Gate the new validation/eval/W&B path first** (~3–4 min, offline, exercises iter-0 validation + sampled-action eval + DCP):
+     ```
+     WANDB_MODE=offline W2A_INSTRUCTIONS="push the box to the right with the right arm" \
+     OVERRIDES="trainer.max_iter=4 trainer.validation_iter=2 trainer.max_val_iter=2 checkpoint.save_iter=4 trainer.logging_iter=1" \
+     EXP=yams_medium NGPU=1 bash mimic_video_port/commands/train.sh
+     ```
+3. **Eval — in-training: DONE (gate PASSED on the node); real-world rollout: pending (explicit end goal).**
+   - **Roadmap to a deployable policy (the agreed plan):** (0) **1-GPU final check** — re-run single-task `yams_medium` with the
+     new config (alpha=1.0 + eval σ=0.9/1.0) and confirm the *honest* `val/action_mse/sigma1.00` falls (the σ=0.5 of run
+     `d9psqgwk` leaked the GT future). → (1) **single-task** longer/multi-GPU run = a deployable push-box policy. → (2)
+     **multi-task** (drop `W2A_INSTRUCTIONS`, all 13 instructions; add a language-sensitivity probe; more steps/GPUs) — here
+     language conditioning must actually matter. → (3) **deploy** (DCP→`.pt` + live rollout), preferring **genvid** features
+     (#30) if the single-forward σ=1.0 signal proves too weak. Each step gates the next on the eval.
+   - **In-training eval (wired + gate-PASSED 2026-06-07):** held-out `val/loss` + the policy's **actual sampled action chunk**
+     vs the demos — `val/action_mse_mean` (raw) + `val/action_nmse_mean` (per-dim-fair), with `val/baseline_hold_last_mse`,
+     `val/echo_mse` and `val/skill_ratio` to expose proprio-echo collapse — all on W&B. The unbiased "is it learning a good
+     policy" signal (`world2action/callbacks.py` + `model.validation_step` + `config.val_action_sigmas`). It reuses the policy
+     sampler `World2ActionPipeline.__call__`, so it also de-risks the deployment inference path. Cost: ~3% (medium) / <1% (full).
+     **Caveat to watch:** these metrics only discriminate a real policy from a do-nothing one when **baseline > 0** (the val
+     episodes contain motion); if `val/baseline_hold_last_mse ≈ 0`, the eval is uninformative regardless (fix = more/representative
+     val episodes; already shuffled + 8 episodes). Multi-task → add the language-sensitivity probe.
+   - **Real-world deployment (pending):** a **live YAMS rollout loop** — read camera_top (720p) + YAM proprio + the task
+     instruction, run the frozen backbone tap + `World2ActionPipeline.__call__` to predict an action chunk, command the
+     bimanual arms; loop. Needs a DCP→`.pt` decoder export (`scripts/convert_distcp_to_pt.py`) + the rollout client.
+     The mimic-video LIBERO/Bridge sim eval is only a reference for the inference wiring. Inference reuses the **same**
+     Reason1 instruction cache + 720p prep as training so features stay in-distribution.
 
 ## Notes
 - Only the small action decoder trains; the 2B backbone is frozen (forward-only; features are cacheable).

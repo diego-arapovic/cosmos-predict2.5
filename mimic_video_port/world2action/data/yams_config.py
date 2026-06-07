@@ -98,10 +98,21 @@ def normalization_types() -> dict:
     return extract_normalization_types(policy_io())
 
 
-def make_dataset(data_dir: str, reason1_cache_path: str, *, train: bool = True, num_val_episodes: int = 1, seed: int = 0):
+def make_dataset(
+    data_dir: str,
+    reason1_cache_path: str,
+    *,
+    train: bool = True,
+    num_val_episodes: int = 1,
+    seed: int = 0,
+    instruction_filter: list[str] | None = None,
+):
     """Build the YAMS world2action MimicDataset. Used as the training config's dataset factory so the
     enum-valued data spec (ObsType/NormalizationType/LieRepr) stays in Python and never enters the Hydra
-    config (which would risk enum->string coercion). The config passes only paths/bools/ints.
+    config (which would risk enum->string coercion). The config passes only paths/bools/ints/strings.
+
+    instruction_filter: if given, train on only the episodes whose `instruction` is in this list (e.g.
+    ["push the box to the right with the right arm"]) -- lets us train per-task on a data subset.
     """
     from .action.dataset_action import MimicDataset
 
@@ -111,4 +122,5 @@ def make_dataset(data_dir: str, reason1_cache_path: str, *, train: bool = True, 
         seed=seed,
         num_val_episodes=num_val_episodes,
         train=train,
+        instruction_filter=instruction_filter,
     )
