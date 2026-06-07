@@ -202,6 +202,8 @@ cython_debug/
 /results/
 /tmp/
 
+/dummy_ep
+
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.mp4

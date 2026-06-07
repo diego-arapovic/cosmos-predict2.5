@@ -1,4 +1,2 @@
 __pycache__/
 *.pyc
-# Capstone WIP (real get_crossattn_emb) — not part of the validated foundation; commit once validated.
-get_crossattn_emb_smoke.py

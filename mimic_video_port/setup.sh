@@ -23,6 +23,13 @@ uv python install
 uv sync --locked --extra="$CUDA_EXTRA"
 # shellcheck disable=SC1091
 source .venv/bin/activate
+# world2action data-prep deps (zarr/mcap/imageio/cv2): not in the upstream lock, so install AFTER
+# `uv sync` (sync makes the venv match the lock and would otherwise drop them). cv2 is usually already
+# present from the cosmos deps — only add headless opencv if it's missing (avoids an opencv conflict).
+# zarr<3 on purpose: the mimic-video data pipeline (writer + MimicDataset reader) uses the zarr v2 API
+# (Group.create_dataset, numcodecs.Blosc); zarr 3 removed it. numcodecs<0.16 stays v2-compatible.
+uv pip install --quiet mcap "zarr<3" "numcodecs<0.16" imageio imageio-ffmpeg threadpoolctl
+python -c "import cv2" 2>/dev/null || uv pip install --quiet opencv-python-headless
 python - <<'PY'
 import torch
 print("torch", torch.__version__, "| cuda_ok", torch.cuda.is_available(),
@@ -50,10 +57,16 @@ echo "==> [4/4] Validation smokes"
 if [ "$SKIP_SMOKES" = "1" ]; then
   echo "  SKIP_SMOKES=1 -> skipped"
 else
-  python "$SCRIPT_DIR/smoke_load_ckpt.py" "$CKPT_LOCAL"
-  python "$SCRIPT_DIR/extract_features_smoke.py" "$CKPT_LOCAL"
-  python "$SCRIPT_DIR/merge_lora_smoke.py" "$CKPT_LOCAL"
-  python "$SCRIPT_DIR/vae_encode_smoke.py"
-  python "$SCRIPT_DIR/reason1_embed_smoke.py"   # first run downloads ~15GB Cosmos-Reason1-7B
+  python "$SCRIPT_DIR/smoke/smoke_load_ckpt.py" "$CKPT_LOCAL"
+  python "$SCRIPT_DIR/smoke/extract_features_smoke.py" "$CKPT_LOCAL"
+  python "$SCRIPT_DIR/smoke/merge_lora_smoke.py" "$CKPT_LOCAL"
+  python "$SCRIPT_DIR/smoke/vae_encode_smoke.py"
+  python "$SCRIPT_DIR/smoke/reason1_embed_smoke.py"            # first run downloads ~15GB Cosmos-Reason1-7B
+  python "$SCRIPT_DIR/smoke/get_crossattn_emb_smoke.py" "$CKPT_LOCAL"   # full end-to-end get_crossattn_emb
 fi
 echo "==> DONE: foundation set up & validated."
+echo ""
+echo "Next (data + training; scratch=/opt/dlami/nvme is fast but EPHEMERAL -> S3 is durable):"
+echo "  1. bash mimic_video_port/commands/prepare_data.sh   # data: scratch <- S3 <- raw+preprocess (caches to S3)"
+echo "  2. bash mimic_video_port/commands/train.sh          # train: ensure data -> resume from S3 -> torchrun -> sync ckpts to S3"
+echo "     (smoke gate first: python mimic_video_port/smoke/train_config_smoke.py yams_smoke)"
